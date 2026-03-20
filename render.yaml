@@ -1,0 +1,16 @@
+services:
+  - type: worker
+    name: keiba-odds-bot
+    runtime: docker
+    plan: free
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DISCORD_CHANNEL_ID
+        sync: false
+      - key: POLL_INTERVAL
+        value: "60"
+      - key: WATCH_JRA
+        value: "true"
+      - key: WATCH_NAR
+        value: "false"
