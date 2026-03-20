@@ -342,6 +342,18 @@ async def cmd_refresh(ctx):
     await ctx.send(f"🔄 レース一覧を更新しました（{len(active_races)}レース: {', '.join(venues) or 'なし'}）")
 
 
+async def start_bot():
+    """Botを非同期で起動（外部ループと共存用）"""
+    if not config.discord_token:
+        logger.error("DISCORD_TOKEN が設定されていません")
+        return
+    if not config.discord_channel_id:
+        logger.error("DISCORD_CHANNEL_ID が設定されていません")
+        return
+
+    await bot.start(config.discord_token)
+
+
 def run():
     if not config.discord_token:
         logger.error("DISCORD_TOKEN が設定されていません")
