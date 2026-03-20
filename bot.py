@@ -66,19 +66,23 @@ async def daily_check():
     """10分ごと: レース一覧更新 & 監視開始通知"""
     global daily_start_notified
 
-    today = datetime.now().strftime("%Y%m%d")
+    try:
+        today = datetime.now().strftime("%Y%m%d")
 
-    # 日付が変わったらリセット
-    if daily_start_notified and not daily_start_notified.startswith(today):
-        daily_start_notified = ""
-        detector._previous.clear()
-        detector._recent_alerts.clear()
+        # 日付が変わったらリセット
+        if daily_start_notified and not daily_start_notified.startswith(today):
+            daily_start_notified = ""
+            detector._previous.clear()
+            detector._recent_alerts.clear()
 
-    # 9:00〜17:00 の間だけレース一覧を更新
-    if not is_race_hours():
+        # 9:00〜17:00 の間だけレース一覧を更新
+        if not is_race_hours():
+            return
+
+        await load_races()
+    except Exception as e:
+        logger.error(f"daily_check error: {e}")
         return
-
-    await load_races()
 
     # 開催日の初回のみ「監視開始」通知を送信
     if active_races and daily_start_notified != today:

@@ -3,14 +3,17 @@
 データ取得方式:
 - レース一覧: race_list_sub.html (AJAX sub-page)
 - オッズ: /api/api_get_jra_odds.html (JSON API, data にHTMLフラグメント)
+- Cloudflare対策: cloudscraper 使用
 """
 import asyncio
+import json
 import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 
-import aiohttp
+import cloudscraper
 from bs4 import BeautifulSoup
 
 from config import config
@@ -53,39 +56,46 @@ class HorseOdds:
 
 class NetkeibaScraper:
     def __init__(self):
-        self._session: aiohttp.ClientSession | None = None
-        self._headers = {
-            "User-Agent": config.user_agent,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        self._scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False},
+        )
+        self._scraper.headers.update({
             "Accept-Language": "ja,en-US;q=0.7,en;q=0.3",
             "Referer": "https://race.netkeiba.com/",
-        }
-
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                headers=self._headers,
-                timeout=aiohttp.ClientTimeout(total=config.request_timeout),
-            )
-        return self._session
+        })
 
     async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
+        pass  # cloudscraper はセッション管理不要
+
+    def _sync_get(self, url: str, params: dict | None = None) -> bytes | None:
+        """同期HTTP GET（cloudscraperはsync only）"""
+        try:
+            resp = self._scraper.get(url, params=params, timeout=config.request_timeout)
+            if resp.status_code == 200:
+                # Cloudflare チャレンジページ検出
+                if "cf-error" in resp.text[:500] or "challenge-platform" in resp.text[:500]:
+                    logger.warning(f"Cloudflare challenge detected: {url}")
+                    return None
+                return resp.content
+            logger.warning(f"HTTP {resp.status_code}: {url}")
+        except Exception as e:
+            logger.warning(f"Fetch error: {e}")
+        return None
 
     async def _fetch_bytes(self, url: str, params: dict | None = None) -> bytes | None:
-        """バイト列を取得（リトライ付き）"""
-        session = await self._get_session()
+        """非同期ラッパー（sync→asyncブリッジ）"""
+        loop = asyncio.get_event_loop()
         for attempt in range(3):
             try:
-                async with session.get(url, params=params) as resp:
-                    if resp.status == 200:
-                        return await resp.read()
-                    logger.warning(f"HTTP {resp.status}: {url}")
+                result = await loop.run_in_executor(
+                    None, partial(self._sync_get, url, params)
+                )
+                if result is not None:
+                    return result
             except Exception as e:
                 logger.warning(f"Fetch error (attempt {attempt + 1}): {e}")
-                if attempt < 2:
-                    await asyncio.sleep(2 * (attempt + 1))
+            if attempt < 2:
+                await asyncio.sleep(2 * (attempt + 1))
         return None
 
     async def _fetch_html(self, url: str, params: dict | None = None) -> str | None:
@@ -102,18 +112,15 @@ class NetkeibaScraper:
 
     async def _fetch_json(self, url: str, params: dict | None = None) -> dict | None:
         """JSONレスポンスを取得"""
-        session = await self._get_session()
-        for attempt in range(3):
-            try:
-                async with session.get(url, params=params) as resp:
-                    if resp.status == 200:
-                        return await resp.json(content_type=None)
-                    logger.warning(f"HTTP {resp.status}: {url}")
-            except Exception as e:
-                logger.warning(f"JSON fetch error (attempt {attempt + 1}): {e}")
-                if attempt < 2:
-                    await asyncio.sleep(2 * (attempt + 1))
-        return None
+        raw = await self._fetch_bytes(url, params)
+        if not raw:
+            return None
+        try:
+            text = raw.decode("utf-8")
+            return json.loads(text)
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            logger.warning(f"JSON decode error: {e}")
+            return None
 
     # ========================
     #  レース一覧取得
@@ -191,11 +198,7 @@ class NetkeibaScraper:
     # ========================
 
     async def get_odds(self, race: RaceInfo) -> list[HorseOdds]:
-        """レースの単勝オッズを取得
-
-        方式1: JSON API（api_get_jra_odds.html）
-        方式2: オッズページ直接パース（APIが使えない場合のフォールバック）
-        """
+        """レースの単勝オッズを取得"""
         # 方式1: API
         odds = await self._get_odds_api(race.race_id)
         if odds:
@@ -220,20 +223,17 @@ class NetkeibaScraper:
         data_html = resp.get("data", "")
 
         if not data_html:
-            logger.debug(f"Odds API empty for {race_id} (status={status}, reason={resp.get('reason', '')})")
+            logger.debug(f"Odds API empty for {race_id} (status={status})")
             return []
 
         return self._parse_odds_html(data_html)
 
     def _parse_odds_html(self, html: str) -> list[HorseOdds]:
-        """APIレスポンスのHTMLフラグメントからオッズをパース
-
-        HTML内の要素: id="odds-1_{umaban}" が単勝オッズ
-        """
+        """APIレスポンスのHTMLフラグメントからオッズをパース"""
         soup = BeautifulSoup(html, "html.parser")
         horses = []
 
-        # 方式A: odds-1_{umaban} IDから取得
+        # odds-1_{umaban} IDから取得
         odds_spans = soup.select("[id^='odds-1_']")
         if odds_spans:
             for span in odds_spans:
@@ -245,7 +245,6 @@ class NetkeibaScraper:
                         continue
                     odds_val = float(odds_text)
 
-                    # 馬名を探す（同じ行内）
                     parent_row = span.find_parent("tr") or span.find_parent("div")
                     name = f"{umaban}番"
                     if parent_row:
@@ -253,7 +252,6 @@ class NetkeibaScraper:
                         if name_el:
                             name = name_el.get_text(strip=True)
 
-                    # 人気を探す
                     popularity = 0
                     pop_el = soup.select_one(f"[id='ninki-rank_{umaban}']")
                     if pop_el:
@@ -271,7 +269,6 @@ class NetkeibaScraper:
                     continue
             return horses
 
-        # 方式B: テーブル行から取得（フォールバック）
         return self._parse_odds_table(soup)
 
     async def _get_odds_page(self, race_id: str) -> list[HorseOdds]:
@@ -282,8 +279,6 @@ class NetkeibaScraper:
             return []
 
         soup = BeautifulSoup(html, "html.parser")
-
-        # ページ内のテーブルからオッズを取得
         return self._parse_odds_table(soup)
 
     def _parse_odds_table(self, soup: BeautifulSoup) -> list[HorseOdds]:
@@ -293,22 +288,18 @@ class NetkeibaScraper:
 
         for row in rows:
             try:
-                # 馬番を含むセルを探す
                 cells = row.select("td")
                 if len(cells) < 2:
                     continue
 
-                # 馬番（通常最初のtdの数字）
                 num_text = cells[0].get_text(strip=True)
                 if not num_text.isdigit():
                     continue
                 number = int(num_text)
 
-                # 馬名
                 name_el = row.select_one("a[href*='horse']")
                 name = name_el.get_text(strip=True) if name_el else f"{number}番"
 
-                # オッズ（数値を含むtd）
                 odds_val = None
                 for cell in cells[1:]:
                     text = cell.get_text(strip=True).replace(",", "")
@@ -319,7 +310,6 @@ class NetkeibaScraper:
                 if odds_val is None:
                     continue
 
-                # 人気
                 popularity = 0
                 pop_el = row.select_one(".Popular, .Ninki")
                 if pop_el:
