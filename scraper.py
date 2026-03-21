@@ -217,16 +217,20 @@ class NetkeibaScraper:
         }
         resp = await self._fetch_json(ODDS_API, params=params)
         if not resp:
+            logger.warning(f"Odds API no response: {race_id}")
             return []
 
         status = resp.get("status", "")
         data_html = resp.get("data", "")
 
         if not data_html:
-            logger.debug(f"Odds API empty for {race_id} (status={status})")
+            logger.warning(f"Odds API empty data: {race_id} (status={status}, keys={list(resp.keys())})")
             return []
 
-        return self._parse_odds_html(data_html)
+        odds = self._parse_odds_html(data_html)
+        if not odds:
+            logger.warning(f"Odds parse returned 0 horses: {race_id} (html_len={len(data_html)})")
+        return odds
 
     def _parse_odds_html(self, html: str) -> list[HorseOdds]:
         """APIレスポンスのHTMLフラグメントからオッズをパース"""
