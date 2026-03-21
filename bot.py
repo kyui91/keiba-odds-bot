@@ -137,6 +137,7 @@ async def odds_monitor():
     all_alerts: list[OddsAlert] = []
     now = datetime.now()
 
+    checked = 0
     for race in active_races:
         priority = get_monitor_priority(race, now)
         if priority == "skip":
@@ -149,15 +150,20 @@ async def odds_monitor():
         try:
             odds = await scraper.get_odds(race)
             if not odds:
+                logger.warning(f"No odds returned: {race.display_name}")
                 continue
 
+            checked += 1
             alerts = detector.check(race, odds)
             all_alerts.extend(alerts)
 
             await asyncio.sleep(1.0)
 
         except Exception as e:
-            logger.error(f"Error monitoring {race.display_name}: {e}")
+            logger.error(f"Error monitoring {race.display_name}: {e}", exc_info=True)
+
+    if checked > 0:
+        logger.info(f"Odds check: {checked} races, {len(all_alerts)} alerts")
 
     if all_alerts:
         msg = format_alerts(all_alerts)
@@ -167,6 +173,11 @@ async def odds_monitor():
             logger.error(f"Discord send error: {e}")
 
     detector.cleanup_old_alerts()
+
+
+@odds_monitor.error
+async def odds_monitor_error(error):
+    logger.error(f"odds_monitor crashed: {error}", exc_info=error)
 
 
 @odds_monitor.before_loop
