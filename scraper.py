@@ -224,7 +224,9 @@ class NetkeibaScraper:
         data_html = resp.get("data", "")
 
         if not data_html:
-            logger.warning(f"Odds API empty data: {race_id} (status={status}, keys={list(resp.keys())})")
+            reason = resp.get("reason", "")
+            unt = resp.get("unt", "")
+            logger.warning(f"Odds API empty data: {race_id} (status={status}, reason={reason}, unt={unt})")
             return []
 
         odds = self._parse_odds_html(data_html)
@@ -280,10 +282,13 @@ class NetkeibaScraper:
         params = {"type": "b1", "race_id": race_id}
         html = await self._fetch_html(ODDS_PAGE, params=params)
         if not html:
+            logger.warning(f"Odds page fetch failed: {race_id}")
             return []
 
         soup = BeautifulSoup(html, "html.parser")
-        return self._parse_odds_table(soup)
+        odds = self._parse_odds_table(soup)
+        logger.info(f"Odds page fallback: {race_id} -> {len(odds)} horses")
+        return odds
 
     def _parse_odds_table(self, soup: BeautifulSoup) -> list[HorseOdds]:
         """テーブル形式のオッズをパース"""
