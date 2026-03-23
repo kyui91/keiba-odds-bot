@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 scraper = NetkeibaScraper()
 detector = OddsDetector()
@@ -27,6 +27,8 @@ detector = OddsDetector()
 active_races: list[RaceInfo] = []
 # 今日の監視開始通知済みフラグ
 daily_start_notified: str = ""
+# アラート送信先チャンネルIDリスト（動的に追加可能）
+alert_channels: set[int] = set(config.discord_channel_ids)
 
 
 # ========================
@@ -52,13 +54,65 @@ def is_race_day() -> bool:
 #  メインループ
 # ========================
 
+async def send_to_all_channels(message: str):
+    """全登録チャンネルにメッセージを送信"""
+    dead_channels = set()
+    for ch_id in alert_channels:
+        channel = bot.get_channel(ch_id)
+        if not channel:
+            continue
+        try:
+            await channel.send(message)
+        except discord.HTTPException as e:
+            logger.error(f"Send error to {ch_id}: {e}")
+            if e.status == 403:  # Forbidden = 権限なし
+                dead_channels.add(ch_id)
+    # 権限のないチャンネルは除外
+    alert_channels.difference_update(dead_channels)
+
+
 @bot.event
 async def on_ready():
-    logger.info(f"Bot ready: {bot.user}")
+    logger.info(f"Bot ready: {bot.user} | Servers: {len(bot.guilds)} | Channels: {len(alert_channels)}")
     if not daily_check.is_running():
         daily_check.start()
     if not odds_monitor.is_running():
         odds_monitor.start()
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    """新しいサーバーに参加した時、適切なチャンネルを自動登録"""
+    # "odds" or "bot" or "競馬" を含むチャンネルを探す、なければ最初のテキストチャンネル
+    target = None
+    for ch in guild.text_channels:
+        name = ch.name.lower()
+        if any(kw in name for kw in ("odds", "bot", "競馬", "keiba", "アラート", "alert")):
+            target = ch
+            break
+    if target is None:
+        # 最初に書き込めるテキストチャンネル
+        for ch in guild.text_channels:
+            if ch.permissions_for(guild.me).send_messages:
+                target = ch
+                break
+
+    if target:
+        alert_channels.add(target.id)
+        logger.info(f"Joined guild: {guild.name} -> channel: #{target.name} ({target.id})")
+        try:
+            await target.send(
+                "**🏇 オッズ急変検知Bot が参加しました！**\n\n"
+                "JRA中央競馬のオッズ急変（急騰・急落）をリアルタイムで検知して通知します。\n\n"
+                "📋 `!help` — コマンド一覧\n"
+                "📊 `!status` — 監視状況を確認\n"
+                "🏇 `!odds 阪神 1` — 指定レースのオッズ表示\n\n"
+                "⏱ 監視時間: 9:00〜17:00（レース開催日のみ）\n"
+                f"🔔 アラート送信先: このチャンネル (#{target.name})\n\n"
+                "チャンネルを変更したい場合: 希望のチャンネルで `!setchannel` を実行してください。"
+            )
+        except discord.HTTPException:
+            pass
 
 
 @tasks.loop(minutes=10)
@@ -87,29 +141,24 @@ async def daily_check():
     # 開催日の初回のみ「監視開始」通知を送信
     if active_races and daily_start_notified != today:
         daily_start_notified = today
-        channel = bot.get_channel(config.discord_channel_id)
-        if channel:
-            venues = {}
-            for race in active_races:
-                venues.setdefault(race.venue, []).append(race)
+        venues = {}
+        for race in active_races:
+            venues.setdefault(race.venue, []).append(race)
 
-            lines = [f"**🏇 本日の競馬オッズ監視を開始します** `{datetime.now().strftime('%Y/%m/%d')}`", ""]
-            for venue, races_list in venues.items():
-                first = min(races_list, key=lambda r: r.post_time or "99:99")
-                last = max(races_list, key=lambda r: r.post_time or "00:00")
-                lines.append(
-                    f"📍 **{venue}** {len(races_list)}R "
-                    f"({first.post_time}〜{last.post_time})"
-                )
+        lines = [f"**🏇 本日の競馬オッズ監視を開始します** `{datetime.now().strftime('%Y/%m/%d')}`", ""]
+        for venue, races_list in venues.items():
+            first = min(races_list, key=lambda r: r.post_time or "99:99")
+            last = max(races_list, key=lambda r: r.post_time or "00:00")
+            lines.append(
+                f"📍 **{venue}** {len(races_list)}R "
+                f"({first.post_time}〜{last.post_time})"
+            )
 
-            lines.append("")
-            lines.append(f"⏱ 監視間隔: {config.poll_interval}秒")
-            lines.append(f"📊 閾値: 低{config.threshold_low}% / 中{config.threshold_mid}% / 高{config.threshold_high}%")
+        lines.append("")
+        lines.append(f"⏱ 監視間隔: {config.poll_interval}秒")
+        lines.append(f"📊 閾値: 低{config.threshold_low}% / 中{config.threshold_mid}% / 高{config.threshold_high}%")
 
-            try:
-                await channel.send("\n".join(lines))
-            except discord.HTTPException as e:
-                logger.error(f"Discord send error: {e}")
+        await send_to_all_channels("\n".join(lines))
 
 
 @daily_check.before_loop
@@ -129,9 +178,7 @@ async def odds_monitor():
     if not is_race_hours() or not active_races:
         return
 
-    channel = bot.get_channel(config.discord_channel_id)
-    if not channel:
-        logger.error(f"Channel not found: {config.discord_channel_id}")
+    if not alert_channels:
         return
 
     all_alerts: list[OddsAlert] = []
@@ -167,10 +214,7 @@ async def odds_monitor():
 
     if all_alerts:
         msg = format_alerts(all_alerts)
-        try:
-            await channel.send(msg)
-        except discord.HTTPException as e:
-            logger.error(f"Discord send error: {e}")
+        await send_to_all_channels(msg)
 
     detector.cleanup_old_alerts()
 
@@ -357,24 +401,91 @@ async def cmd_refresh(ctx):
     await ctx.send(f"🔄 レース一覧を更新しました（{len(active_races)}レース: {', '.join(venues) or 'なし'}）")
 
 
+@bot.command(name="setchannel")
+async def cmd_setchannel(ctx):
+    """このチャンネルをアラート送信先に設定"""
+    if not ctx.guild:
+        await ctx.send("サーバー内で実行してください")
+        return
+
+    # このサーバーの既存チャンネルを除去して新しいチャンネルを登録
+    guild_channel_ids = {ch.id for ch in ctx.guild.text_channels}
+    alert_channels.difference_update(guild_channel_ids)
+    alert_channels.add(ctx.channel.id)
+
+    await ctx.send(f"✅ このチャンネル (#{ctx.channel.name}) をアラート送信先に設定しました")
+    logger.info(f"Channel set: {ctx.guild.name} -> #{ctx.channel.name} ({ctx.channel.id})")
+
+
+@bot.command(name="help")
+async def cmd_help(ctx):
+    """コマンド一覧を表示"""
+    embed = discord.Embed(
+        title="🏇 オッズ急変検知Bot",
+        description="JRA中央競馬のオッズ急変をリアルタイム検知",
+        color=0x00B894,
+    )
+    embed.add_field(
+        name="📋 基本コマンド",
+        value=(
+            "`!status` — 監視状況を表示\n"
+            "`!odds 阪神 1` — 指定レースの単勝オッズ\n"
+            "`!refresh` — レース一覧を再取得\n"
+            "`!help` — このヘルプを表示"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⚙️ 設定コマンド",
+        value=(
+            "`!threshold` — 閾値の確認\n"
+            "`!threshold 15 20 25` — 閾値を変更\n"
+            "`!setchannel` — アラート送信先を変更"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⏱ 監視仕様",
+        value=(
+            "**時間**: 9:00〜17:00（レース開催日のみ自動）\n"
+            "**頻度**: 発走60〜10分前は60秒間隔 / 10分前〜発走は15秒間隔\n"
+            "**検知**: オッズ帯別の閾値で急騰🔺・急落🔻を判定"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="開発: @kyui91 | GitHub: kyui91/keiba-odds-bot")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="invite")
+async def cmd_invite(ctx):
+    """Botの招待リンクを表示"""
+    if bot.user:
+        url = discord.utils.oauth_url(
+            bot.user.id,
+            permissions=discord.Permissions(
+                send_messages=True,
+                read_messages=True,
+                embed_links=True,
+                read_message_history=True,
+            ),
+        )
+        await ctx.send(f"**🔗 Bot招待リンク**\n{url}")
+
+
 async def start_bot():
     """Botを非同期で起動（外部ループと共存用）"""
     if not config.discord_token:
         logger.error("DISCORD_TOKEN が設定されていません")
         return
-    if not config.discord_channel_id:
-        logger.error("DISCORD_CHANNEL_ID が設定されていません")
-        return
 
+    logger.info(f"Starting bot with {len(alert_channels)} alert channel(s)")
     await bot.start(config.discord_token)
 
 
 def run():
     if not config.discord_token:
         logger.error("DISCORD_TOKEN が設定されていません")
-        return
-    if not config.discord_channel_id:
-        logger.error("DISCORD_CHANNEL_ID が設定されていません")
         return
 
     bot.run(config.discord_token)

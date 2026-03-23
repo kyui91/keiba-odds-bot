@@ -6,11 +6,26 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _parse_channel_ids(raw: str) -> list[int]:
+    """カンマ区切りのチャンネルIDをパース"""
+    ids = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.append(int(part))
+    return ids
+
+
 @dataclass
 class Config:
     # Discord
     discord_token: str = os.getenv("DISCORD_TOKEN", "")
+    # 既存の単一チャンネル（後方互換）
     discord_channel_id: int = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
+    # 複数チャンネル対応（カンマ区切り）
+    discord_channel_ids: list[int] = field(default_factory=lambda: _parse_channel_ids(
+        os.getenv("DISCORD_CHANNEL_IDS", os.getenv("DISCORD_CHANNEL_ID", "0"))
+    ))
 
     # スクレイピング間隔（秒）
     poll_interval: int = int(os.getenv("POLL_INTERVAL", "60"))
